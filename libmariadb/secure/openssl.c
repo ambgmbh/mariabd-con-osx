@@ -25,6 +25,9 @@
 #include <string.h>
 #include <mysql/client_plugin.h>
 #include <string.h>
+#ifdef WIN32
+#include <wincrypt.h>
+#endif
 #include <openssl/ssl.h> /* SSL and SSL_CTX */
 #include <openssl/err.h> /* error reporting */
 #include <openssl/conf.h>
@@ -87,6 +90,55 @@ static int ma_bio_write(BIO *h, const char *buf, int size);
 static BIO_METHOD ma_BIO_method;
 #endif
 
+#ifdef WIN32
+
+/* Opposite to *nix platforms, certificates on Windows are stored
+   in the registry and need to be loaded into a X509_STORE */
+static int load_windows_cert_store(X509_STORE *x509_store, const char *store_name)
+{
+  HCERTSTORE hcstore;
+  PCCERT_CONTEXT pctx= NULL;
+  X509 *cert= NULL;
+
+  /* Check parameters */
+  if (!x509_store || !store_name || !store_name[0])
+    return 1;
+
+  if (!(hcstore = CertOpenSystemStoreA((HCRYPTPROV_LEGACY)NULL, store_name)))
+    return 1;
+
+  while ((pctx= CertEnumCertificatesInStore(hcstore, pctx)))
+  {
+    FILETIME ft_now;
+
+    if (!pctx->pbCertEncoded)
+      continue;
+
+    /* check if cert expired */
+    GetSystemTimeAsFileTime(&ft_now);
+    if (CompareFileTime(&ft_now, &pctx->pCertInfo->NotAfter) > 0 ||
+        CompareFileTime(&pctx->pCertInfo->NotBefore, &ft_now) > 0)
+      continue;
+
+    /* decode cert and add it to x509_store */
+    if ((cert= d2i_X509(NULL, (const unsigned char **)&pctx->pbCertEncoded, pctx->cbCertEncoded)))
+    {
+      if (!X509_STORE_add_cert(x509_store, cert))
+      {
+        X509_free(cert);
+        continue;
+      }
+      X509_free(cert);
+    } else
+      continue;
+  }
+  CertFreeCertificateContext(pctx);
+  CertCloseStore(hcstore, 0);
+
+  return 0;
+}
+
+#endif
 
 static long ma_tls_version_options(const char *version)
 {
@@ -339,6 +391,25 @@ static int ma_tls_set_certs(MYSQL *mysql, SSL_CTX *ctx)
       goto error;
   }
 
+#ifdef WIN32
+  /* OpenSSL doesn't install any certificates on windows,
+     so we need to import them from Windows cert store. */
+  if (!mysql->options.ssl_ca && !mysql->options.ssl_capath)
+  {
+    X509_STORE *certstore;
+
+    if (certstore= SSL_CTX_get_cert_store(ctx))
+    {
+      if (load_windows_cert_store(certstore, "CA"))
+      {
+        my_set_error(mysql, CR_SSL_CONNECTION_ERROR, SQLSTATE_UNKNOWN,
+                   CER(CR_SSL_CONNECTION_ERROR), "Unable to load windows trust store");
+        return 1;
+      }
+    }
+  }
+#endif
+
   /* ca_file and ca_path */
   if (!SSL_CTX_load_verify_locations(ctx,
                                     mysql->options.ssl_ca,
@@ -349,6 +420,7 @@ static int ma_tls_set_certs(MYSQL *mysql, SSL_CTX *ctx)
     if (SSL_CTX_set_default_verify_paths(ctx) == 0)
       goto error;
   }
+
 
   if (mysql->options.extension &&
      (mysql->options.extension->ssl_crl || mysql->options.extension->ssl_crlpath))
